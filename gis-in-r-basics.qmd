@@ -1,0 +1,589 @@
+---
+title: "GIS in R Basics Training"
+author: "Steer"
+format: html
+editor: visual
+---
+
+### Install & Load Packages
+
+```{r}
+
+packages <- c(
+  'quarto',
+  'sf',
+  'tidyverse',
+  'mapview',
+  'rjson',  
+  'jsonlite',
+  'tigris',
+  'tidycensus',
+  'data.table',
+  'viridis',
+  'fs',
+  'here'
+  )
+
+if(!require(pacman)) install.packages('pacman')
+pacman::p_load(packages,character.only = T)
+
+i_am('src/gis-in-r-basics.qmd')
+```
+
+### Read input data
+
+Source: [Citi Bike system data](http://gbfs.citibikenyc.com/gbfs/gbfs.json)
+
+```{r}
+
+input <- list() #does pre-defining length & names speed up writing to list?
+
+station_info = "https://gbfs.citibikenyc.com/gbfs/en/station_information.json"
+station_status = "https://gbfs.citibikenyc.com/gbfs/en/station_status.json"
+
+
+#Citi bike station information text file. 
+input$bike_stations_info <- rjson::fromJSON(file = station_info) # please change back if using just rjson - ku 
+
+input$bike_stations_status <- rjson::fromJSON(file = station_status)
+
+```
+
+# Working with "messy" data
+
+Description of what messy data is.
+
+Imagine city of NY wants to see if CitiBike can replace trips made by other modes. First we need to conduct an assessment of current conditions:
+
+### Working with text data / manipulations - NDL
+
+```{r}
+
+#"tidying" function
+tidy_json <- \(x) {x[['data']][['stations']] %>% 
+    list_transpose() %>% # what is list transpose - ku 
+    as_tibble()}
+
+#working data storage list
+bike_stations <- vector(mode = 'list', length = 3) %>% #next time no need to name args
+  set_names('info', 'sf', 'status')
+
+# cleaning data
+bike_stations$info <- tidy_json(input$bike_stations_info) %>% 
+    select(c('station_id', 'name', 'capacity', 'lon', 'lat'))
+
+# quickly view format
+head(bike_stations$info)
+```
+
+```{r create geometry-object}
+
+# another method using jsonlite
+jsonlite::fromJSON(txt = station_info)$data$stations %>% 
+  select(c('station_id', 'name', 'capacity', 'lon', 'lat')) %>% 
+  setdiff(bike_stations$info)
+
+#spatial layer
+bike_stations$sf <- bike_stations$info %>% 
+  st_as_sf(coords = c('lon', 'lat'))
+
+mapview(bike_stations$sf)
+```
+
+What's going on? This doesn't tell us anything about where the stations are. Need to add a coordinate reference system.
+
+```{r}
+#spatial layer with crs
+bike_stations$sf <- bike_stations$info %>% 
+  st_as_sf(coords = c('lon', 'lat'),
+           crs = st_crs(4326))
+
+mapview(bike_stations$sf)
+```
+
+Color by attribute.
+
+```{r}
+
+mapview(bike_stations$sf, zcol = 'capacity')
+#same thing with rail stations 
+```
+
+One last step. Let's attach live station info to the points layer. Then we have a better understanding of dock availability.
+
+```{r bike station info}
+
+names(bike_stations)
+
+bike_stations$status <- bike_stations$sf %>% 
+  left_join(input$bike_stations_status %>% 
+              tidy_json() %>% 
+              select(station_id, num_docks_available),
+            by = 'station_id')
+
+head(bike_stations$status)
+```
+
+### Analysis - Replica Data (Destinations Mode Opportunity)
+
+```{r replica destinations}
+
+#read data
+input$replica <- read_csv(here('input/replica/kings-county--ny-trends_trip_count_od_destination_v2-mode-from_week_of_2023-03-11_to_week_of_2023-03-17-weekday.csv')) #could have also downloaded destinations data only
+
+head(input$replica)
+
+```
+
+```{r}
+
+#initialize object to store analyses 
+trip_table_analysis <- vector('list', 4) %>% 
+  set_names(c('destinations_summary', 'layer','spatial_join', 'result'))
+
+#summarize by destination
+trip_table_analysis$destinations_summary <- input$replica %>% 
+  group_by(across(starts_with('destination'))) %>%  #all destination meta-data should be consistent across destination-related records
+  summarise(across(ends_with('trip_count'),
+                   \(x) sum(x, na.rm = TRUE)),
+                  # ~sum(.x, na.rm = TRUE))  
+            .groups = 'drop')
+```
+
+Time to attach to tract geometries!
+
+```{r tigris}
+
+#load spatial data for Brooklyn
+input$kings_sf <- tigris::tracts(state = 'NY', county = 'Kings', year = 2022) %>% 
+  mutate(geoid = as.numeric(GEOID))
+
+mapview(input$kings_sf)
+```
+
+```{r attach trips}
+
+trip_table_analysis$layer <- input$kings_sf %>% 
+  left_join(trip_table_analysis$destinations_summary,
+            by = c('geoid' = 'destination_geo_id'))
+
+mapview(trip_table_analysis$layer, zcol = 'private_auto_trip_count')
+
+nrow(filter(trip_table_analysis$layer, is.na(private_auto_trip_count)))
+```
+
+Too many NA's, we might have to download tract geometries from Replica directly:
+
+```{r replica layers}
+input$replica_sf <- st_read(here('input/replica/trct.geojson')) %>% 
+  mutate(geoid = as.numeric(id)) %>% 
+  filter(str_detect(name, 'Kings, NY')) #since source file contains all mid-Atlantic states
+```
+
+```{r replica source geometries}
+
+# join again
+trip_table_analysis$layer <- input$replica_sf %>% 
+  left_join(trip_table_analysis$destinations_summary,
+            by = c('geoid' = 'destination_geo_id'))
+
+mapview(trip_table_analysis$layer, zcol = 'private_auto_trip_count',
+         layer.name = 'destinating trips')
+
+nrow(filter(trip_table_analysis$layer, is.na(private_auto_trip_count)))
+```
+
+Still some NAs, but significantly less. We live with it for now.
+
+Now let's look at citibike parking potential per census tract.
+
+```{r citibike parking potential}
+
+trip_table_analysis$spatial_join <- trip_table_analysis$layer %>% 
+  st_join(bike_stations$sf, 
+          join = st_intersects, #by spatial intersection
+          suffix = c('.tract', '.bike_station'))
+
+head(trip_table_analysis$spatial_join)
+```
+
+```{r summarise join}
+
+trip_table_analysis$spatial_join <- trip_table_analysis$spatial_join %>% 
+  group_by(geometry) %>% 
+  summarise(total_bike_capacity = sum(capacity),
+            names.bike_station = list(name.bike_station),
+            across(1:13, first))
+
+
+mapview(trip_table_analysis$spatial_join, zcol = 'total_bike_capacity')
+```
+
+Finally, also include citibike actual parking availability.
+
+```{r CitiBike availibility}
+
+#code copied from above
+trip_table_analysis$spatial_join <- trip_table_analysis$layer %>% 
+  st_join(bike_stations$status, #from sf to status
+          join = st_intersects, #by spatial intersection
+          suffix = c('.tract', '.bike_station')) %>% 
+  group_by(geometry) %>% 
+  summarise(total_bike_capacity = sum(capacity),
+            total_dock_availibility = sum(num_docks_available), #new line relevant to new data
+            names.bike_station = list(name.bike_station),
+            across(1:13, first)) %>% 
+  mutate(across(.cols = ends_with('availibility'),
+                \(x) replace_na(x, 0))) #add this line to replace NAs (which signal no spatial intersection) with 0s
+
+mapview(trip_table_analysis$spatial_join, zcol = 'total_dock_availibility')
+```
+
+Final code chunk summarizing main results of analysis before more informational/useful visuals.
+
+```{r results & summary}
+
+trip_table_analysis$result <- trip_table_analysis$spatial_join %>% 
+  rowwise() %>% 
+  mutate(all_modes_trip_count = sum(c_across(ends_with('trip_count')))) %>% 
+  ungroup() %>% 
+  mutate(citibike_potential_as_prop_of_total_trips = total_dock_availibility/all_modes_trip_count,
+         citibike_potential_as_prop_of_auto_trips = total_dock_availibility/(private_auto_trip_count + on_demand_auto_trip_count)) %>% 
+  select(c(geometry, total_bike_capacity, total_dock_availibility, ends_with('trip_count')), starts_with('citibike_potential'))
+  
+mapview(trip_table_analysis$result, zcol = 'citibike_potential_as_prop_of_total_trips')
+
+summary(trip_table_analysis$result)
+```
+
+### Data visualizations - AXL
+
+A lattice view can help us compare dock availibility vs. total destinating trips side-by-side at census tract level.
+
+Cluster counters
+
+```{r}
+
+map_docAvalibility<-mapview(trip_table_analysis$result, zcol = 'citibike_potential_as_prop_of_total_trips')
+map_trips<-mapview(trip_table_analysis$spatial_join, zcol = 'total_bike_capacity')
+
+
+sync(map_docAvalibility,map_trips)
+
+```
+
+ggplot can help us erase water and tighten up visual details.
+
+```{r}
+
+nice_map <- trip_table_analysis$result %>% 
+  st_transform(26918) %>% #speeds operations if you transform to projected crs
+  erase_water() %>% 
+  ggplot(aes(fill = citibike_potential_as_prop_of_auto_trips)) + 
+    geom_sf(color = 'black', lwd = 0.0005) + 
+    theme_void() + 
+    scale_fill_viridis_c(labels = scales::label_percent()) +
+  labs(title = 'CitiBike Dock Availibility',
+       fill = '% of auto trips')
+
+nice_map
+
+```
+
+# Working with "tidy" data
+
+### Data prep
+
+```{r looking at variables from the american community survey}
+#pivot wider vs. in-house tidycensus wide format features 
+
+# I enjoy using = for assignment, please change if you feel the need to - ku
+vars = load_variables( 2020,'acs5') |> # base pipe!, will not work with older R versions
+  as.data.table()
+
+head(vars)
+
+```
+
+```{r}
+vars[
+  grepl('Estimate!!Total:$',label) & grepl('RACE',concept)
+]
+
+```
+
+B02001_001 looks interesting. ..
+
+```{r}
+vars[
+  grepl('B02001',name) # hmmm I'll look at the first three variables 
+]
+```
+
+```{r}
+kings_pop = get_acs(
+  geography = 'block group',
+  year = 2020,
+  variables = vars[grepl('B02001',name)][
+    1:3, # get the first three rows 
+    set_names(name, c('total','white','black')) # name vector
+  ],
+  county = 'kings',
+  state = 'ny',
+  geometry = T
+)
+
+head(kings_pop)
+
+```
+
+Having this data in in a long format may not be the best choice, let's widen the variable column into three columns.
+
+```{r}
+# using the tidyverse, specifically tidyr 
+
+pivot_wider(
+  select(kings_pop, GEOID, variable,estimate),
+  names_from = 'variable',
+  values_from = 'estimate'
+)
+
+```
+
+### Beyond the Tidyverse
+
+```{r}
+kings_dt = as.data.table(kings_pop)
+
+dcast( 
+  # sadly this function has yet to support list columns, so it is necessary to 
+  # rejoin the geometry column
+  kings_dt[j = .(GEOID,variable,estimate)],
+  ... ~ variable,
+  value.var = 'estimate'
+)[
+  # rejoining data 
+  kings_dt,
+  on = 'GEOID', 
+  geometry := geometry
+][]
+```
+
+```{r look at the documentation!}
+?tidycensus::get_acs
+
+# there's an argument (output) that can change the dimensions of the data
+
+```
+
+### Playing Around With Census Data
+
+```{r}
+kings_pop = pivot_wider(
+  select(kings_pop, GEOID, variable,estimate),
+  names_from = 'variable',
+  values_from = 'estimate'
+) |> 
+  filter(!is.na(total) & total > 0)
+```
+
+```{r some simple calculations}
+
+kings_pop = mutate(
+  kings_pop,
+  pct_black = black/total * 100
+)
+
+pct_black = mapview(
+    kings_pop,
+    zcol = 'pct_black',
+    col.regions = mako(
+      n_distinct(filter(kings_pop,!is.na(pct_black))$pct_black),
+      direction = -1
+      ),
+    layer.name = '% of Population Black or African American alone (Brooklyn, NY)'
+  )
+
+pct_black
+
+```
+
+```{r}
+
+citi = st_as_sf(
+  fromJSON(station_info)$data$stations,
+  coords = c('lon','lat'),
+  crs = 4326
+  ) |> 
+  left_join(
+    fromJSON(station_status)$data$stations,
+    by = 'station_id'
+  )
+```
+
+```{r}
+bk_citi = st_filter(
+  citi,
+  kings_pop
+) |> 
+  st_join(
+    select(kingPops,GEOID)
+  )
+```
+
+What's going on with the CRS?
+
+```{r}
+st_crs(kings_pop)
+```
+
+```{r}
+bk_citi = st_filter(
+  st_transform(citi,st_crs(kings_pop)),
+  kings_pop
+) |> 
+  st_join(
+    select(kings_pop,GEOID)
+  )
+
+mapview(select(bk_citi,capacity), layer.name = 'Dock Capacity')
+```
+
+```{r count how many stations are in each block group}
+kings_pop = mutate(
+  kings_pop,
+  stations = lengths(st_intersects(kings_pop,bk_citi))
+)
+```
+
+```{r unioning these block groups to tracts}
+mutate(
+  kings_pop,
+  tract = str_sub(GEOID,1,11) # tract GEOID is first 11 characters
+) |> 
+  group_by(tract) |> 
+  summarize(
+    stations = sum(stations),
+    pct_black = sum(black)/sum(total) *100
+  ) |> 
+  (\(x){
+    mapview(
+      x,
+      zcol = 'stations',
+      layer.name = 'Count of Citi Bike Stations in Brooklyn by Tract',
+      col.regions = inferno(n_distinct(x$stations)),
+      alpha.regions = 0.6
+      ) + mapview(
+        x,
+        zcol = 'pct_black',
+        layer.name = '% Black by Tract',
+        col.regions = mako(n_distinct(x$pct_black), direction = -1),
+        alpha.regions = 0.6
+  )
+  })()
+```
+
+### Going on a Parking Tangent
+
+```{r}
+vars[grep('household size by',concept,ignore.case = T)]
+```
+
+```{r}
+# getting household vehicle ownership by tract
+nyc_veh = get_acs(
+  geography = 'tract',
+  year = 2020,
+  variables = vars[grepl('B08201',name)][
+    1:6, # get the first three rows 
+    set_names(name, c('total','no_veh', paste0('veh_',1:4))) # name vector
+  ],
+  county = c('kings', 'queens','richmond','new york', 'bronx'),
+  state = 'ny',
+  geometry = T
+) |> 
+  select(GEOID,NAME,variable,estimate) |> 
+  pivot_wider(
+  names_from = 'variable',
+  values_from = 'estimate'
+  ) |> 
+  st_transform(2263) |> 
+  erase_water()
+```
+
+```{r}
+nyc_veh = mutate(
+  nyc_veh,
+  pct_no_veh = no_veh/total* 100
+) |> filter(total > 0)
+
+mapview(
+  nyc_veh,
+  zcol = 'pct_no_veh',
+  col.regions = mako(n_distinct(nyc_veh$pct_no_veh)),
+  layer.name = '% of Households with No Vehicle'
+)
+```
+
+Source: [NYC Open Data](https://data.cityofnewyork.us/Transportation/Parking-Meters-ParkNYC-Blockfaces/s7zi-dgdx)
+
+```{r}
+parking = read_sf(
+  'https://data.cityofnewyork.us/api/geospatial/s7zi-dgdx?method=export&format=GeoJSON'
+  ) |> 
+  st_transform(2263)
+```
+
+```{r}
+parking |> 
+  filter(borough == 'Bronx') |> 
+  (\(x){
+    mapview(
+      x,
+      zcol = 'meter_rate',
+      layer.name = 'Metered Parking in the Bronx'
+      )
+    }
+  )()
+```
+
+```{r}
+parking_tracts = st_intersection(
+    select(
+      parking,
+      #filter(parking,str_detect(vehicle_ty,'All')), # get parking for all vehicles 
+      meter_rate,
+      borough
+      ),
+    nyc_veh
+    ) |> 
+  mutate(len = units::set_units(st_length(geometry),km) |> as.numeric())
+
+```
+
+```{r}
+left_join(
+  nyc_veh,
+  as.data.table(parking_tracts)[
+    j = .(metered_parking = sum(len)),
+    by = .(GEOID)
+  ],
+  by = 'GEOID'
+) |> 
+  mutate(metered_parking = nafill(metered_parking,fill = 0)) |> 
+  (\(x){
+    mapview(
+      x,
+      zcol = 'metered_parking',
+      col.regions = mako(n_distinct(x$metered_parking)),
+      layer.name = 'Amount of Metered Parking in NYC by Tract (in km)'
+    )
+  })()
+
+```
+
+### Visualizations - TBD
+
+Visualize popular origins, destinations, and inter-zonal flows?
+
+\*Note we focused on vector data today, but can use other packages for diff types of geographic data (i.e. raster, etc.)
